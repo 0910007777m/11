@@ -1,0 +1,319 @@
+# =============================================================================
+# ETERNAL RDP SERVICE - THEORETICAL 10 MILLION DAY OPERATION
+# =============================================================================
+name: Eternal-RDP-Service
+
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    # Automatic trigger every 5 hours as backup
+    - cron: '0 */5 * * *'
+  repository_dispatch:
+    types: [respawn-eternal-rdp]
+
+jobs:
+  eternal-rdp-instance:
+    runs-on: windows-2025
+    
+    # Maximum allowed by GitHub (72 hours for paid accounts)
+    # For free accounts, this will be capped at 360 minutes automatically
+    timeout-minutes: 4320
+
+    steps:
+      # ========== VERIFICATION AND ATTRIBUTION ==========
+      - name: Ownership Verification (Encoded)
+        run: |
+          $encodedNotice = "Cj09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQogQ29weXJpZ2h0IMKpIDIwMjUgVG9vbGJveExhcC54eXogfCBodHRwczovL3d3dy50b29sYm94bGFwLnh5ei8KIEFsbCByaWdodHMgcmVzZXJ2ZWQuIERvIG5vdCByZW1vdmUgb3IgbW9kaWZ5IGNvcHlyaWdodCB0ZXh0LgogWW91VHViZTogaHR0cHM6Ly93d3cueW91dHViZS5jb20vY2hhbm5lbC9VQ0RUNGZzOUp3cm5RSVhQclhYOHlIZVEKIEZhY2Vib29rOiBodHRwczovL3d3dy5mYWNlYm9vay5jb20vcHJvZmlsZS5waHA/aWQ9NjE1Njc4OTY2OTI5OTQKIEFueSBjaGFuZ2VzIHdpbGwgYXV0b21hdGljYWxseSBkaXNhYmxlIHRoaXMgc2NyaXB0IQo9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0K"
+          $decodedNotice = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encodedNotice))
+          Write-Host $decodedNotice
+          if (-not $decodedNotice -or $decodedNotice -notlike "*ToolboxLap.xyz*") {
+              Write-Error "Copyright violation detected – script halted!"
+              exit 1
+          }
+
+      # ========== INSTALLATION AND CONFIGURATION ==========
+      - name: Install GitHub CLI (Silent Method)
+        run: |
+          Write-Host "Downloading GitHub CLI MSI..."
+          $msiUrl = "https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_windows_amd64.msi"
+          $msiPath = "$env:TEMP\gh.msi"
+          
+          Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath
+          
+          Write-Host "Installing GitHub CLI silently..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msiPath`"", "/quiet", "/norestart", "/qn" -Wait
+          
+          Remove-Item $msiPath -Force
+          
+          # Add to PATH
+          $ghPaths = @(
+              "$env:ProgramFiles\GitHub CLI",
+              "${env:ProgramFiles(x86)}\GitHub CLI"
+          )
+          
+          foreach ($path in $ghPaths) {
+              if (Test-Path $path) {
+                  echo $path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                  Write-Host "GitHub CLI installed at: $path"
+                  break
+              }
+          }
+          
+          # Verify installation
+          gh --version
+
+      - name: Configure Core RDP Settings
+        run: |
+          Write-Host "Enabling RDP..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          
+          Write-Host "Configuring firewall..."
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
+          Write-Host "Restarting Terminal Services..."
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured successfully!"
+
+      - name: Create RDP User with Static Password
+        run: |
+          $password = "admin@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $username = "TOOLBOXLAP"
+          
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              Write-Host "Creating user $username..."
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          }
+          
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          Write-Host "Downloading Tailscale..."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          
+          Write-Host "Installing Tailscale..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "/qn" -Wait
+          
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed!"
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Find Tailscale
+          $tsPaths = @(
+              "$env:ProgramFiles\Tailscale\tailscale.exe",
+              "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe",
+              "$env:LOCALAPPDATA\Tailscale\tailscale.exe"
+          )
+          
+          $tsExe = $null
+          foreach ($path in $tsPaths) {
+              if (Test-Path $path) {
+                  $tsExe = $path
+                  break
+              }
+          }
+          
+          if (-not $tsExe) {
+              Write-Error "Tailscale not found!"
+              exit 1
+          }
+          
+          Write-Host "Connecting to Tailscale..."
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=eternal-runner-$env:GITHUB_RUN_ID
+          
+          # Get IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = & $tsExe ip -4 2>$null
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 10
+                  $retries++
+              }
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP port on $env:TAILSCALE_IP..."
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "✓ RDP port accessible"
+          } else {
+              Write-Warning "Port test failed - continuing anyway"
+          }
+
+      # ========== PERSISTENT NOTIFICATION CHANNELS ==========
+      - name: Broadcast to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          $message = @"
+          🌍 **ETERNAL RDP INSTANCE ACTIVE**
+          - **Tailscale IP:** `$env:TAILSCALE_IP`
+          - **Username:** TOOLBOXLAP
+          - **Password:** admin@123
+          - **Instance ID:** `$env:GITHUB_RUN_ID`
+          - **Repository:** `$env:GITHUB_REPOSITORY`
+          - **Target Uptime:** 10,000,000 days (chain method)
+          
+          This instance will auto-respawn before termination.
+          "@
+          
+          $telegramUrl = "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendMessage"
+          $body = @{
+              chat_id = $env:TELEGRAM_CHAT_ID
+              text = $message
+              parse_mode = "Markdown"
+          } | ConvertTo-Json
+          
+          try {
+              Invoke-RestMethod -Uri $telegramUrl -Method Post -ContentType "application/json" -Body $body
+              Write-Host "Telegram notification sent"
+          } catch {
+              Write-Warning "Telegram send failed"
+          }
+
+      - name: Broadcast to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if ($env:DISCORD_WEBHOOK) {
+              $message = @{
+                  content = "🌍 **ETERNAL RDP INSTANCE ACTIVE**`nIP: $env:TAILSCALE_IP`nUser: TOOLBOXLAP`nPass: admin@123`nID: $env:GITHUB_RUN_ID"
+              } | ConvertTo-Json
+              
+              try {
+                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType "application/json" -Body $message
+                  Write-Host "Discord notification sent"
+              } catch {
+                  Write-Warning "Discord send failed"
+              }
+          }
+
+      # ========== PERSISTENT STORAGE FOR CHAIN TRACKING ==========
+      - name: Update Eternal Chain Counter
+        run: |
+          $counterFile = "eternal_chain.txt"
+          $chainCount = 1
+          
+          # Try to get previous count from a persistent source
+          # In a real implementation, you'd use GitHub Artifacts, S3, or a database
+          # For this example, we'll simulate with a local file
+          
+          if (Test-Path $counterFile) {
+              $chainCount = [int](Get-Content $counterFile) + 1
+          }
+          
+          Set-Content -Path $counterFile -Value $chainCount
+          Write-Host "===================="
+          Write-Host "ETERNAL CHAIN COUNT: $chainCount"
+          Write-Host "TARGET: 10,000,000 days (36,525,000,000 instances needed)"
+          Write-Host "PROGRESS: $([math]::Round(($chainCount / 36525000000) * 100, 20))%"
+          Write-Host "===================="
+          
+          # Save for next instance (in real world, upload to cloud storage)
+          echo "CHAIN_COUNT=$chainCount" >> $env:GITHUB_ENV
+
+      # ========== IMMORTAL KEEP-ALIVE WITH RESPAWN ==========
+      - name: Maintain Connection & Schedule Resurrection
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = "$env:GITHUB_REPOSITORY"
+          $workflow_id = "Eternal-RDP-Service.yml"
+          
+          # Determine max runtime based on account type
+          $maxJobMinutes = 350  # Free tier: 5 hours 50 minutes (safety buffer)
+          # For paid accounts, change to: $maxJobMinutes = 4310 (71 hours 50 minutes)
+          
+          $checkIntervalSeconds = 60
+          $startTime = Get-Date
+          $chainCount = $env:CHAIN_COUNT
+          
+          # Calculate theoretical timeline
+          $daysPerInstance = $maxJobMinutes / 1440  # 1440 minutes = 1 day
+          $totalDaysSoFar = [math]::Round($chainCount * $daysPerInstance, 2)
+          $remainingDays = 10000000 - $totalDaysSoFar
+          $remainingInstances = [math]::Round($remainingDays / $daysPerInstance, 0)
+          
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════════════╗"
+          Write-Host "║                 ETERNAL RDP SERVICE ACTIVE               ║"
+          Write-Host "╠══════════════════════════════════════════════════════════╣"
+          Write-Host "║ Tailscale IP: $($env:TAILSCALE_IP.PadRight(30))║"
+          Write-Host "║ Username:     TOOLBOXLAP                                 ║"
+          Write-Host "║ Password:     admin@123                                  ║"
+          Write-Host "╠══════════════════════════════════════════════════════════╣"
+          Write-Host "║ Chain Link:   #$chainCount                               ║"
+          Write-Host "║ Days Elapsed: $($totalDaysSoFar.ToString().PadRight(20)) days║"
+          Write-Host "║ Days Left:    $($remainingDays.ToString().PadRight(20)) days║"
+          Write-Host "║ Instances Left: $($remainingInstances.ToString().PadRight(17))║"
+          Write-Host "╚══════════════════════════════════════════════════════════╝"
+          Write-Host ""
+          Write-Host "Powered by ToolboxLap.xyz - Eternal Chain Technology"
+          Write-Host ""
+          
+          # Main loop - runs until it's time to respawn
+          while ($true) {
+              $elapsed = (Get-Date) - $startTime
+              $elapsedMinutes = $elapsed.TotalMinutes
+              $remainingMinutes = $maxJobMinutes - $elapsedMinutes
+              
+              # Calculate estimated end of chain
+              if ($remainingMinutes -le 0) {
+                  $etaText = "NOW"
+              } elseif ($remainingMinutes -lt 60) {
+                  $etaText = "$([math]::Round($remainingMinutes, 1)) minutes"
+              } else {
+                  $etaText = "$([math]::Round($remainingMinutes / 60, 2)) hours"
+              }
+              
+              Write-Host "[$(Get-Date)] Chain #$chainCount | Uptime: $([math]::Round($elapsedMinutes, 2)) min | Respawn in: $etaText"
+              
+              # Check if it's time to respawn (5 minutes before termination)
+              if ($elapsedMinutes -ge ($maxJobMinutes - 5)) {
+                  Write-Host ""
+                  Write-Host "🔄 INITIATING CHAIN RESPAWN - INSTANCE #$($chainCount + 1)"
+                  Write-Host ""
+                  
+                  # Trigger the next instance
+                  gh workflow run $workflow_id --repo $repo
+                  
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "✓ Next eternal instance triggered successfully!"
+                      Write-Host "Chain continues..."
+                      Write-Host ""
+                      Write-Host "Waiting 30 seconds for propagation then terminating..."
+                      Start-Sleep -Seconds 30
+                      exit 0
+                  } else {
+                      Write-Host "✗ Respawn failed - will retry in 2 minutes"
+                      # Reset timer to give retry time
+                      $startTime = (Get-Date).AddMinutes(-($maxJobMinutes - 7))
+                  }
+              }
+              
+              Start-Sleep -Seconds $checkIntervalSeconds
+          }
